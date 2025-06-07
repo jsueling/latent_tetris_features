@@ -1,16 +1,22 @@
 """Load and train a Variational Autoencoder (VAE) for Tetris game states."""
-
-import os
+from collections import defaultdict
+import random
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+import numpy as np
+
+import tetris_dataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
 LATENT_DIM = 64
 GRID_SIZE = 200
 PIECE_CLASSES = 7
+NUM_EPOCHS = 100
+PATIENCE = 10 # Epochs to wait before early stopping
 
 class TetrisVAE(nn.Module):
     """
@@ -27,35 +33,55 @@ class TetrisVAE(nn.Module):
         self.latent_dim = latent_dim
 
         # Encoder layers
-        self.fc_encoder = nn.Linear(grid_size + piece_classes, hidden_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(grid_size + piece_classes, 256),
+            nn.ReLU(),
+            nn.Linear(256, hidden_dim),
+            nn.ReLU()
+        )
+
+        # Latent space
         self.fc_mean = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
-        # Decoder layers
-        self.fc_decoder = nn.Linear(latent_dim, grid_size + piece_classes)
+        # Decoder layers with symmetric structure
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 256),
+            nn.ReLU()
+        )
+
+        # Multi-head output
+        self.fc_grid = nn.Linear(256, grid_size)
+        self.fc_piece = nn.Linear(256, piece_classes)
 
     def encode(self, x):
         """Encodes the input into mean and variance vectors of the latent space vector z."""
-        h = F.relu(self.fc_encoder(x))
-        z_mean = self.fc_mean(h)
-        z_logvar = self.fc_logvar(h)
+        x = self.encoder(x)
+        z_mean = self.fc_mean(x)
+        z_logvar = self.fc_logvar(x)
         return z_mean, z_logvar
 
     def reparameterise(self, z_mean, z_logvar):
-        """Applies the reparameterisation trick to sample z from the latent space."""
+        """Applies the reparameterisation trick to sample z from the latent space distribution."""
         std = torch.exp(0.5 * z_logvar) # σ = exp(0.5 × log(σ²)) = √(σ²)
         eps = torch.randn_like(std)
         return z_mean + eps * std # z = μ + σ × ε
 
     def decode(self, z):
-        """Decodes the latent space vector z back to the original input space."""
+        """
+        Decodes the latent space vector z back to the original input space.
+        returns probabilities for reconstructed grid and
+        raw logits for the reconstructed piece.
+        """
         # Outputs raw logits
-        decoded_features = self.fc_decoder(z)
+        z = self.decoder(z)
         # Sigmoid converts to binary probabilities for grid reconstruction
-        grid_out = torch.sigmoid(decoded_features[:, :self.grid_size])
-        # Softmax converts to probabilities for piece classification
-        piece_out = F.softmax(decoded_features[:, self.grid_size:], dim=1)
-        return grid_out, piece_out
+        grid_out = torch.sigmoid(self.fc_grid(z))
+        # return raw logits for piece classification
+        piece_logits = self.fc_piece(z)
+        return grid_out, piece_logits
 
     def forward(self, x, training=True):
         """
@@ -91,30 +117,36 @@ def load_model(model, path):
     model.load_state_dict(torch.load(path))
     return model
 
-def test_model():
+def encode_sample_to_latent(sample):
+    """Maps input sample to latent space"""
     model = TetrisVAE().to(DEVICE)
-    load_model(model, "out/tetris_vae.pth")
-    model.forward(training=False)
+    model = load_model(model, "./out/best_model.pth")
+    return model(sample, training=False)
 
 def vae_loss(grid_true, grid_recon, piece_true, piece_recon, z_mean, z_logvar):
     """Computes the loss for the VAE model."""
 
     # Grid reconstruction loss (binary cross-entropy)
-    grid_bce_loss = F.binary_cross_entropy(
-        grid_recon,
-        grid_true,
-        reduction='sum'
-    ) / grid_true.size(0) # Average per sample
+
+    # Totals per pixel_ce between each reconstructed grid and true grid
+    # then divides over all dimensions (num_pixels * batch_size)
+    # giving mean pixel_ce in the batch
+    pixel_bce = F.binary_cross_entropy(
+        grid_recon, grid_true, reduction='mean'
+    )
+
+    grid_bce = pixel_bce * grid_true.size(1) # Scale by number of pixels
 
     # Piece reconstruction loss (categorical cross-entropy)
-    piece_cce_loss = F.cross_entropy(
-        torch.log(piece_recon + 1e-9), # Add small constant for numerical stability
+
+    # Mean piece_ce per sample in the batch
+    piece_ce = F.cross_entropy(
+        piece_recon, # raw logits
         torch.argmax(piece_true, dim=1),
         reduction='mean'
     )
 
-    # Weighted reconstruction loss
-    reconstruction_loss = (0.95 * grid_bce_loss) + (0.05 * piece_cce_loss)
+    reconstruction_loss = pixel_bce + piece_ce
 
     # KL Divergence loss
     kl_div_loss = -0.5 * torch.sum(
@@ -123,58 +155,116 @@ def vae_loss(grid_true, grid_recon, piece_true, piece_recon, z_mean, z_logvar):
     )
     kl_div_loss = kl_div_loss.mean() # Average KLD per sample
 
-    # Total loss
+    # ELBO loss
     return reconstruction_loss + kl_div_loss
 
-if __name__ == "__main__":
+def train_model():
+    """
+    Trains the Tetris VAE model on the Tetris dataset.
+    """
 
-    from torch.utils.data import DataLoader
-    import tetris_dataset
+    # Set random seed for reproducibility
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
 
-    # Load dataset
-    dataloader = DataLoader(
-        tetris_dataset.TetrisDataset(device=DEVICE),
+    # Load and split dataset
+    full_dataset = tetris_dataset.TetrisDataset(device=DEVICE)
+    # 80 / 20 split
+    train_set, validation_set = random_split(full_dataset, [0.8, 0.2])
+
+    train_loader = DataLoader(
+        train_set,
         batch_size=BATCH_SIZE,
-        shuffle=True,
-        pin_memory=(DEVICE.type=='cuda')
+        shuffle=True
+    )
+
+    validation_loader = DataLoader(
+        validation_set,
+        batch_size=BATCH_SIZE
     )
 
     # Initialise model and optimiser
     model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
-    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=5, factor=0.5)
 
-    # Training loop
-    def train_epoch():
+    epochs_no_improvement = 0
+    piece_correct = 0
+    total_samples = 0
+    history = defaultdict(list)
+    best_validation_loss = float('inf')
+
+    # Main loop
+    for epoch in range(NUM_EPOCHS):
+
+        # Training phase
         model.train()
-        total_loss = 0
-
-        for batch_idx, sample_batch in enumerate(dataloader):
-
-            grid_true, piece_true = sample_batch[:, :-7], sample_batch[:, -7:]
+        train_loss = 0
+        for batch in train_loader:
 
             optimiser.zero_grad()
 
-            # Forward pass
-            grid_recon, piece_recon, z_mean, z_logvar = model(sample_batch)
+            grid_true, piece_true = batch[:, :-7], batch[:, -7:]
+            grid_recon, piece_recon, z_mean, z_logvar = model(batch)
 
-            # Calculate loss
             loss = vae_loss(
                 grid_true, grid_recon,
                 piece_true, piece_recon,
                 z_mean, z_logvar
             )
 
-            # Backward pass
             loss.backward()
             optimiser.step()
+            train_loss += loss.item()
 
-            total_loss += loss.item()
+        # Validation phase
+        model.eval()
+        validation_loss = 0
+        with torch.no_grad():
+            for batch in validation_loader:
 
-            if batch_idx % 10 == 0:
-                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                grid_true, piece_true = batch[:, :-7], batch[:, -7:]
 
-        return total_loss / len(dataloader)
+                grid_recon, piece_recon, z_mean, z_logvar = model(batch)
+                loss = vae_loss(
+                    grid_true, grid_recon,
+                    piece_true, piece_recon,
+                    z_mean, z_logvar
+                )
 
-    # Train for one epoch
-    avg_loss = train_epoch()
-    print(f"Average Loss: {avg_loss:.4f}")
+                validation_loss += loss.item()
+
+                _, preds = torch.max(F.softmax(piece_recon, dim=1), 1)
+                # Count correct predictions for piece classification
+                piece_correct += (preds == torch.argmax(piece_true, dim=1)).sum().item()
+                # Count total samples processed, used to calculate piece accuracy
+                total_samples += piece_true.size(0)
+
+        # Update metrics
+        avg_train_loss = train_loss / len(train_loader)
+        avg_validation_loss = validation_loss / len(validation_loader)
+        piece_accuracy = piece_correct / total_samples
+
+        history['train_loss'].append(round(avg_train_loss, 3))
+        history['validation_loss'].append(round(avg_validation_loss, 3))
+        history['piece_accuracy'].append(round(piece_accuracy, 3))
+
+        # Update learning rate
+        scheduler.step(avg_validation_loss)
+
+        # Save history every epoch
+        np.save("./out/tetris_vae_history.npy", history)
+
+        # Early stopping check
+        if avg_validation_loss < best_validation_loss:
+            best_validation_loss = avg_validation_loss
+            epochs_no_improvement = 0
+            save_model(model, "./out/best_model.pth")
+        else:
+            epochs_no_improvement += 1
+            if epochs_no_improvement >= PATIENCE:
+                break
+
+if __name__ == "__main__":
+    train_model()
