@@ -25,7 +25,14 @@ class TetrisVAE(nn.Module):
     and decodes it back to reconstruct the original input.
     """
 
-    def __init__(self, grid_size=200, piece_classes=7, latent_dim=64, hidden_dim=128):
+    def __init__(
+            self,
+            grid_size=200,
+            piece_classes=7,
+            latent_dim=64,
+            hidden_dim=128,
+            dropout_rate=0.2
+        ):
 
         super(TetrisVAE, self).__init__()
         self.grid_size = grid_size
@@ -36,8 +43,10 @@ class TetrisVAE(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(grid_size + piece_classes, 256),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(256, hidden_dim),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
         )
 
         # Latent space
@@ -48,8 +57,10 @@ class TetrisVAE(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, 256),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
         )
 
         # Multi-head output
@@ -123,7 +134,12 @@ def encode_sample_to_latent(sample):
     model = load_model(model, "./out/best_model.pth")
     return model(sample, training=False)
 
-def vae_loss(grid_true, grid_recon, piece_true, piece_recon, z_mean, z_logvar):
+def vae_loss(
+        grid_true, grid_recon,
+        piece_true, piece_recon,
+        z_mean, z_logvar,
+        epoch
+    ):
     """Computes the loss for the VAE model."""
 
     # Grid reconstruction loss (binary cross-entropy)
@@ -155,8 +171,12 @@ def vae_loss(grid_true, grid_recon, piece_true, piece_recon, z_mean, z_logvar):
     )
     kl_div_loss = kl_div_loss.mean() # Average KLD per sample
 
-    # ELBO loss
-    return reconstruction_loss + kl_div_loss
+    # KL annealing allows the reconstruction loss to dominate in early epochs
+    kl_weight = min(1.0, epoch / NUM_EPOCHS)
+
+    elbo_loss = reconstruction_loss + kl_weight * kl_div_loss
+
+    return elbo_loss, pixel_bce, piece_ce, kl_div_loss
 
 def train_model():
     """
@@ -208,15 +228,21 @@ def train_model():
             grid_true, piece_true = batch[:, :-7], batch[:, -7:]
             grid_recon, piece_recon, z_mean, z_logvar = model(batch)
 
-            loss = vae_loss(
+            loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
                 grid_true, grid_recon,
                 piece_true, piece_recon,
-                z_mean, z_logvar
+                z_mean, z_logvar,
+                epoch=epoch
             )
 
             loss.backward()
             optimiser.step()
             train_loss += loss.item()
+
+        # Stores the last training batch's loss values for logging
+        history['pixel_bce'].append(round(pixel_bce.item(), 3))
+        history['piece_ce'].append(round(piece_ce.item(), 3))
+        history['kl_div_loss'].append(round(kl_div_loss.item(), 3))
 
         # Validation phase
         model.eval()
@@ -227,10 +253,11 @@ def train_model():
                 grid_true, piece_true = batch[:, :-7], batch[:, -7:]
 
                 grid_recon, piece_recon, z_mean, z_logvar = model(batch)
-                loss = vae_loss(
+                loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
                     grid_true, grid_recon,
                     piece_true, piece_recon,
-                    z_mean, z_logvar
+                    z_mean, z_logvar,
+                    epoch=epoch
                 )
 
                 validation_loss += loss.item()
