@@ -94,7 +94,7 @@ class TetrisVAE(nn.Module):
         piece_logits = self.fc_piece(z)
         return grid_out, piece_logits
 
-    def forward(self, x, training=True):
+    def forward(self, x, training=None):
         """
         Forward pass through the VAE
         """
@@ -103,10 +103,13 @@ class TetrisVAE(nn.Module):
             "Input must be a 2D tensor (batch_size, features)"
         assert x.shape[1] == self.grid_size + self.piece_classes, \
             f"Expected shape[1]: {self.grid_size + self.piece_classes}, got {x.shape[1]}"
+        assert training in [True, False], \
+            "training must be set to True or False"
 
-        if not training:
+        if training is True:
+            self.train()
+        else:
             self.eval()
-            return self.reparameterise(*self.encode(x))
 
         # Encode to latent space
         z_mean, z_logvar = self.encode(x)
@@ -151,7 +154,7 @@ def vae_loss(
         grid_recon, grid_true, reduction='mean'
     )
 
-    grid_bce = pixel_bce * grid_true.size(1) # Scale by number of pixels
+    # grid_bce = pixel_bce * grid_true.size(1) # Scale by number of pixels
 
     # Piece reconstruction loss (categorical cross-entropy)
 
@@ -183,13 +186,11 @@ def train_model():
     Trains the Tetris VAE model on the Tetris dataset.
     """
 
-    # Set random seed for reproducibility
-    torch.manual_seed(0)
-    np.random.seed(0)
-    random.seed(0)
-
     # Load and split dataset
     full_dataset = tetris_dataset.TetrisDataset(device=DEVICE)
+
+    print(f"Dataset size: {len(full_dataset)} samples")
+
     # 80 / 20 split
     train_set, validation_set = random_split(full_dataset, [0.8, 0.2])
 
@@ -219,14 +220,13 @@ def train_model():
     for epoch in range(NUM_EPOCHS):
 
         # Training phase
-        model.train()
         train_loss = 0
         for batch in train_loader:
 
             optimiser.zero_grad()
 
             grid_true, piece_true = batch[:, :-7], batch[:, -7:]
-            grid_recon, piece_recon, z_mean, z_logvar = model(batch)
+            grid_recon, piece_recon, z_mean, z_logvar = model(batch, training=True)
 
             loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
                 grid_true, grid_recon,
@@ -245,14 +245,13 @@ def train_model():
         history['kl_div_loss'].append(round(kl_div_loss.item(), 3))
 
         # Validation phase
-        model.eval()
         validation_loss = 0
         with torch.no_grad():
             for batch in validation_loader:
 
                 grid_true, piece_true = batch[:, :-7], batch[:, -7:]
 
-                grid_recon, piece_recon, z_mean, z_logvar = model(batch)
+                grid_recon, piece_recon, z_mean, z_logvar = model(batch, training=False)
                 loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
                     grid_true, grid_recon,
                     piece_true, piece_recon,
@@ -261,10 +260,10 @@ def train_model():
                 )
 
                 validation_loss += loss.item()
-
-                _, preds = torch.max(F.softmax(piece_recon, dim=1), 1)
+                predictions = torch.argmax(F.softmax(piece_recon, dim=1), dim=1)
+                truths = torch.argmax(piece_true, dim=1)
                 # Count correct predictions for piece classification
-                piece_correct += (preds == torch.argmax(piece_true, dim=1)).sum().item()
+                piece_correct += (predictions == truths).sum().item()
                 # Count total samples processed, used to calculate piece accuracy
                 total_samples += piece_true.size(0)
 
@@ -293,5 +292,53 @@ def train_model():
             if epochs_no_improvement >= PATIENCE:
                 break
 
+    return history, epoch
+
+def reconstruction_test():
+    """
+    Tests the reconstruction quality of Tetris states using the trained VAE model.
+    """
+    model = TetrisVAE().to(DEVICE)
+    model = load_model(model, "./out/model.pth")
+    data_loader = DataLoader(tetris_dataset.TetrisDataset(device=DEVICE), shuffle=True)
+
+    for _ in range(10):
+        true_sample = next(iter(data_loader))
+        with torch.no_grad():
+            grid_recon, piece_recon, _, _ = model(true_sample, training=False)
+        piece = torch.zeros(1, 7)
+        piece[0, torch.argmax(F.softmax(piece_recon, dim=1), dim=1)] = 1
+        reconstructed_sample = torch.cat([(grid_recon > 0.5).float(), piece], dim=1)
+
+        print("True sample:")
+        for row in true_sample:
+            for col_idx, col_val in enumerate(row):
+                if col_idx <= 200 and col_idx % 10 == 0:
+                    print()
+                print(int(col_val), end='')
+            print()
+            print("-"*20)
+
+        print("Reconstructed sample:")
+        for row in reconstructed_sample:
+            for col_idx, col_val in enumerate(row):
+                if col_idx <= 200 and col_idx % 10 == 0:
+                    print()
+                print(int(col_val), end='')
+            print()
+            print("-"*20)
+
 if __name__ == "__main__":
-    train_model()
+
+    # Set random seed for reproducibility
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+
+    history, epochs = train_model()
+    print(f"Training completed after {epochs} epochs.")
+    for key, values in history.items():
+        print(key)
+        print(values)
+
+    # reconstruction_test()
