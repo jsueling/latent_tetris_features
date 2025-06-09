@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import numpy as np
+import matplotlib.pyplot as plt
 
 import tetris_dataset
 
@@ -15,7 +16,8 @@ BATCH_SIZE = 128
 LATENT_DIM = 64
 GRID_SIZE = 200
 PIECE_CLASSES = 7
-NUM_EPOCHS = 100
+NUM_EPOCHS = 200
+WARMUP_EPOCHS = 10 # Epochs to allow KL annealing
 PATIENCE = 10 # Epochs to wait before early stopping
 
 class TetrisVAE(nn.Module):
@@ -31,7 +33,7 @@ class TetrisVAE(nn.Module):
             piece_classes=7,
             latent_dim=64,
             hidden_dim=128,
-            dropout_rate=0.2
+            dropout_rate=0.3
         ):
 
         super(TetrisVAE, self).__init__()
@@ -143,7 +145,7 @@ def vae_loss(
         z_mean, z_logvar,
         epoch
     ):
-    """Computes the loss for the VAE model."""
+    """Computes the loss for the VAE model. Returns losses per sample of this batch"""
 
     # Grid reconstruction loss (binary cross-entropy)
 
@@ -165,17 +167,19 @@ def vae_loss(
         reduction='mean'
     )
 
-    reconstruction_loss = pixel_bce + piece_ce
+    reconstruction_loss = 5 * pixel_bce + piece_ce
 
     # KL Divergence loss
     kl_div_loss = -0.5 * torch.sum(
         1 + z_logvar - z_mean.pow(2) - z_logvar.exp(),
         dim=1 # Sum KLD over all latent dimensions
     )
+
     kl_div_loss = kl_div_loss.mean() # Average KLD per sample
 
     # KL annealing allows the reconstruction loss to dominate in early epochs
-    kl_weight = min(1.0, epoch / NUM_EPOCHS)
+    max_kl_weight = 0.05
+    kl_weight = min(max_kl_weight, epoch / WARMUP_EPOCHS * max_kl_weight)
 
     elbo_loss = reconstruction_loss + kl_weight * kl_div_loss
 
@@ -211,16 +215,17 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=5, factor=0.5)
 
     epochs_no_improvement = 0
-    piece_correct = 0
-    total_samples = 0
     history = defaultdict(list)
     best_validation_loss = float('inf')
+    validation_samples = len(validation_loader.dataset)
+    training_samples = len(train_loader.dataset)
 
     # Main loop
     for epoch in range(NUM_EPOCHS):
 
         # Training phase
         train_loss = 0
+
         for batch in train_loader:
 
             optimiser.zero_grad()
@@ -237,21 +242,23 @@ def train_model():
 
             loss.backward()
             optimiser.step()
-            train_loss += loss.item()
-
-        # Stores the last training batch's loss values for logging
-        history['pixel_bce'].append(round(pixel_bce.item(), 3))
-        history['piece_ce'].append(round(piece_ce.item(), 3))
-        history['kl_div_loss'].append(round(kl_div_loss.item(), 3))
+            train_loss += loss.item() * batch.size(0)
 
         # Validation phase
         validation_loss = 0
+        validation_correct_pieces = 0
+        validation_correct_pixels = 0
+        validation_pixel_bce = 0
+        validation_piece_ce = 0
+        validation_kl_div_loss = 0
+
         with torch.no_grad():
             for batch in validation_loader:
 
                 grid_true, piece_true = batch[:, :-7], batch[:, -7:]
 
                 grid_recon, piece_recon, z_mean, z_logvar = model(batch, training=False)
+
                 loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
                     grid_true, grid_recon,
                     piece_true, piece_recon,
@@ -259,28 +266,48 @@ def train_model():
                     epoch=epoch
                 )
 
-                validation_loss += loss.item()
-                predictions = torch.argmax(F.softmax(piece_recon, dim=1), dim=1)
-                truths = torch.argmax(piece_true, dim=1)
+                validation_pixel_bce += pixel_bce.item() * batch.size(0)
+                validation_piece_ce += piece_ce.item() * batch.size(0)
+                validation_kl_div_loss += kl_div_loss.item() * batch.size(0)
+
+                validation_loss += loss.item() * batch.size(0)
+
+                piece_predictions = torch.argmax(F.softmax(piece_recon, dim=1), dim=1)
+                piece_truths = torch.argmax(piece_true, dim=1)
                 # Count correct predictions for piece classification
-                piece_correct += (predictions == truths).sum().item()
-                # Count total samples processed, used to calculate piece accuracy
-                total_samples += piece_true.size(0)
+                validation_correct_pieces += (piece_predictions == piece_truths).sum().item()
 
-        # Update metrics
-        avg_train_loss = train_loss / len(train_loader)
-        avg_validation_loss = validation_loss / len(validation_loader)
-        piece_accuracy = piece_correct / total_samples
+                pixel_predictions = (grid_recon > 0.5).float()
+                # Count correct pixel predictions
+                validation_correct_pixels += (pixel_predictions == grid_true).float().sum().item()
 
-        history['train_loss'].append(round(avg_train_loss, 3))
-        history['validation_loss'].append(round(avg_validation_loss, 3))
-        history['piece_accuracy'].append(round(piece_accuracy, 3))
+        # Per sample metrics calculated from the validation set
+        avg_train_loss = train_loss / training_samples
+        avg_validation_loss = validation_loss / validation_samples
+
+        avg_piece_accuracy = validation_correct_pieces / validation_samples
+        avg_pixel_accuracy = validation_correct_pixels / (validation_samples * GRID_SIZE)
+        avg_pixel_bce = validation_pixel_bce / validation_samples
+        avg_piece_ce = validation_piece_ce / validation_samples
+        avg_kl_div_loss = validation_kl_div_loss / validation_samples
+
+        history['avg_train_loss'].append(avg_train_loss)
+        history['avg_validation_loss'].append(avg_validation_loss)
+        history['avg_piece_accuracy'].append(avg_piece_accuracy)
+        history['avg_pixel_accuracy'].append(avg_pixel_accuracy)
+        history['avg_pixel_bce'].append(avg_pixel_bce)
+        history['avg_piece_ce'].append(avg_piece_ce)
+        history['avg_kl_div_loss'].append(avg_kl_div_loss)
 
         # Update learning rate
-        scheduler.step(avg_validation_loss)
+        if epoch > WARMUP_EPOCHS:
+            scheduler.step(avg_validation_loss)
 
         # Save history every epoch
         np.save("./out/tetris_vae_history.npy", history)
+
+        if epoch <= WARMUP_EPOCHS:
+            continue
 
         # Early stopping check
         if avg_validation_loss < best_validation_loss:
@@ -294,12 +321,62 @@ def train_model():
 
     return history, epoch
 
+def plot_history(history_dict):
+    """
+    Plots the training history of the VAE model.
+    """
+
+    plt.figure(figsize=(15, 12))
+
+    # Plot losses
+    plt.subplot(2, 2, 1)
+    plt.plot(history_dict['avg_train_loss'], label='Training Loss')
+    plt.plot(history_dict['avg_validation_loss'], label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+
+    # Plot accuracies
+    plt.subplot(2, 2, 2)
+    plt.plot(history_dict['avg_piece_accuracy'], label='Piece Accuracy')
+    plt.plot(history_dict['avg_pixel_accuracy'], label='Pixel Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Piece and Pixel Accuracy')
+    plt.legend()
+    plt.grid(True)
+
+    # Plot component losses
+    plt.subplot(2, 2, 3)
+    plt.plot(history_dict['avg_pixel_bce'], label='Pixel BCE')
+    plt.plot(history_dict['avg_piece_ce'], label='Piece CE')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Component Reconstruction Losses')
+    plt.legend()
+    plt.grid(True)
+
+    # Plot KL divergence loss
+    plt.subplot(2, 2, 4)
+    plt.plot(history_dict['avg_kl_div_loss'], label='KL Divergence')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('KL Divergence Loss')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig('./out/training_history.png')
+    plt.show()
+
 def reconstruction_test():
     """
     Tests the reconstruction quality of Tetris states using the trained VAE model.
     """
     model = TetrisVAE().to(DEVICE)
-    model = load_model(model, "./out/model.pth")
+    model = load_model(model, "./out/best_model.pth")
     data_loader = DataLoader(tetris_dataset.TetrisDataset(device=DEVICE), shuffle=True)
 
     for _ in range(10):
@@ -328,6 +405,12 @@ def reconstruction_test():
             print()
             print("-"*20)
 
+def latent_space_interpolation_test():
+    """
+    Tests the latent space interpolation of the VAE model.
+    """
+    pass
+
 if __name__ == "__main__":
 
     # Set random seed for reproducibility
@@ -336,9 +419,9 @@ if __name__ == "__main__":
     random.seed(0)
 
     history, epochs = train_model()
+
     print(f"Training completed after {epochs} epochs.")
-    for key, values in history.items():
-        print(key)
-        print(values)
+
+    plot_history(history)
 
     # reconstruction_test()

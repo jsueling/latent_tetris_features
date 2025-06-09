@@ -2,3 +2,4 @@ test.py
 data/
 out/
 __pycache__/
+.DS_Store
