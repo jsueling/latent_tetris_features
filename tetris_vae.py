@@ -3,7 +3,7 @@ from collections import defaultdict
 import random
 
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import numpy as np
@@ -13,12 +13,13 @@ import tetris_dataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
-LATENT_DIM = 64
+LATENT_DIM = 2
 GRID_SIZE = 200
 PIECE_CLASSES = 7
 NUM_EPOCHS = 200
-WARMUP_EPOCHS = 10 # Epochs to allow KL annealing
-PATIENCE = 10 # Epochs to wait before early stopping
+WARMUP_EPOCHS = 10 # Epochs to wait before early stopping may occur
+PATIENCE = 30 # Epochs to wait before early stopping after no improvement
+CYCLE_LENGTH = 10
 
 class TetrisVAE(nn.Module):
     """
@@ -31,9 +32,7 @@ class TetrisVAE(nn.Module):
             self,
             grid_size=200,
             piece_classes=7,
-            latent_dim=64,
-            hidden_dim=128,
-            dropout_rate=0.3
+            latent_dim=2,
         ):
 
         super(TetrisVAE, self).__init__()
@@ -41,33 +40,41 @@ class TetrisVAE(nn.Module):
         self.piece_classes = piece_classes
         self.latent_dim = latent_dim
 
-        # Encoder layers
-        self.encoder = nn.Sequential(
-            nn.Linear(grid_size + piece_classes, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(256, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
+        # Encoder
+        encoder_hidden_dims = [128, 64, 32]
+        encoder_dropout_rate = 0.1
+
+        encoder_layers = []
+        input_dim = grid_size + piece_classes
+        for output_dim in encoder_hidden_dims:
+            encoder_layers.append(nn.Linear(input_dim, output_dim))
+            encoder_layers.append(nn.ReLU())
+            encoder_layers.append(nn.Dropout(encoder_dropout_rate))
+            input_dim = output_dim
+
+        self.encoder = nn.Sequential(*encoder_layers)
 
         # Latent space
-        self.fc_mean = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.fc_mean = nn.Linear(encoder_hidden_dims[-1], latent_dim)
+        self.fc_logvar = nn.Linear(encoder_hidden_dims[-1], latent_dim)
 
-        # Decoder layers with symmetric structure
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
+        # Decoder
+        decoder_hidden_dims = [32, 64]
+        decoder_dropout_rate = 0.5
+
+        decoder_layers = []
+        input_dim = latent_dim
+        for output_dim in decoder_hidden_dims:
+            decoder_layers.append(nn.Linear(input_dim, output_dim))
+            decoder_layers.append(nn.ReLU())
+            decoder_layers.append(nn.Dropout(decoder_dropout_rate))
+            input_dim = output_dim
+
+        self.decoder = nn.Sequential(*decoder_layers)
 
         # Multi-head output
-        self.fc_grid = nn.Linear(256, grid_size)
-        self.fc_piece = nn.Linear(256, piece_classes)
+        self.fc_grid = nn.Linear(decoder_hidden_dims[-1], grid_size)
+        self.fc_piece = nn.Linear(decoder_hidden_dims[-1], piece_classes)
 
     def encode(self, x):
         """Encodes the input into mean and variance vectors of the latent space vector z."""
@@ -119,6 +126,10 @@ class TetrisVAE(nn.Module):
         # Reparameterisation trick
         z = self.reparameterise(z_mean, z_logvar)
 
+        if training:
+            # Add noise during training for robustness
+            z = z + 0.1 * torch.randn_like(z)
+
         # Decode reconstructions
         grid_recon, piece_recon = self.decode(z)
 
@@ -167,19 +178,26 @@ def vae_loss(
         reduction='mean'
     )
 
-    reconstruction_loss = 5 * pixel_bce + piece_ce
+    reconstruction_loss = pixel_bce + piece_ce
 
     # KL Divergence loss
-    kl_div_loss = -0.5 * torch.sum(
-        1 + z_logvar - z_mean.pow(2) - z_logvar.exp(),
-        dim=1 # Sum KLD over all latent dimensions
-    )
 
-    kl_div_loss = kl_div_loss.mean() # Average KLD per sample
+    kl_per_dim = -0.5 * (1 + z_logvar - z_mean.pow(2) - z_logvar.exp())
 
-    # KL annealing allows the reconstruction loss to dominate in early epochs
-    max_kl_weight = 0.05
-    kl_weight = min(max_kl_weight, epoch / WARMUP_EPOCHS * max_kl_weight)
+    free_bits = 0.5
+    constrained_kl = torch.max(kl_per_dim, torch.tensor(free_bits, device=DEVICE))
+
+    # Sum KL divergence across latent dimensions then mean over batch
+    kl_div_loss = torch.sum(constrained_kl, dim=1).mean()
+
+    # KL weight strategy cycling between annealing and full KL phases
+    max_kl_weight = 1.0
+    if epoch % CYCLE_LENGTH < CYCLE_LENGTH // 2:
+        # Annealing phase
+        kl_weight = (epoch % (CYCLE_LENGTH // 2)) / (CYCLE_LENGTH // 2) * max_kl_weight
+    else:
+        # Full KL phase
+        kl_weight = max_kl_weight
 
     elbo_loss = reconstruction_loss + kl_weight * kl_div_loss
 
@@ -211,8 +229,13 @@ def train_model():
 
     # Initialise model and optimiser
     model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
-    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=5, factor=0.5)
+    encoder_params = list(model.encoder.parameters()) + list(model.fc_mean.parameters()) + list(model.fc_logvar.parameters())
+    decoder_params = list(model.decoder.parameters()) + list(model.fc_grid.parameters()) + list(model.fc_piece.parameters())
+    optimiser = torch.optim.Adam([
+        {'params': encoder_params, 'weight_decay': 1e-5},
+        {'params': decoder_params, 'weight_decay': 1e-4}
+        ], lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=1, factor=0.5)
 
     epochs_no_improvement = 0
     history = defaultdict(list)
@@ -299,8 +322,8 @@ def train_model():
         history['avg_piece_ce'].append(avg_piece_ce)
         history['avg_kl_div_loss'].append(avg_kl_div_loss)
 
-        # Update learning rate
-        if epoch > WARMUP_EPOCHS:
+        # Update learning rate at the start of each cycle
+        if epoch > 0 and epoch % CYCLE_LENGTH == 0:
             scheduler.step(avg_validation_loss)
 
         # Save history every epoch
@@ -378,9 +401,11 @@ def reconstruction_test():
     model = TetrisVAE().to(DEVICE)
     model = load_model(model, "./out/best_model.pth")
     data_loader = DataLoader(tetris_dataset.TetrisDataset(device=DEVICE), shuffle=True)
+    data_iterator = iter(data_loader)
 
     for _ in range(10):
-        true_sample = next(iter(data_loader))
+        true_sample = next(data_iterator)
+
         with torch.no_grad():
             grid_recon, piece_recon, _, _ = model(true_sample, training=False)
         piece = torch.zeros(1, 7)
@@ -411,6 +436,31 @@ def latent_space_interpolation_test():
     """
     pass
 
+def map_latent_space_to_grid():
+    """
+    Maps the latent space of the VAE model to visualise in 2d.
+    """
+    model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
+    model = load_model(model, "./out/best_model.pth")
+    plt.figure(figsize=(15, 12))
+
+    dataset = tetris_dataset.TetrisDataset(device=DEVICE)
+    indices = torch.randperm(len(dataset))[:10000]
+    subset = torch.utils.data.Subset(dataset, indices)
+    dataloader = DataLoader(subset, batch_size=128)
+    with torch.no_grad():
+        for sample in dataloader:
+            _, _, z_mean, z_logvar = model(sample, training=False)
+            z = model.reparameterise(z_mean, z_logvar)
+            plt.scatter(z[:, 0].cpu(), z[:, 1].cpu(), alpha=0.5)
+
+    plt.xlabel('z0 (latent dimension 1)')
+    plt.ylabel('z1 (latent dimension 2)')
+    plt.title('Latent Space Mapping of Tetris States')
+    plt.grid(True)
+    plt.savefig('./out/latent_space.png')
+    plt.show()
+
 if __name__ == "__main__":
 
     # Set random seed for reproducibility
@@ -425,3 +475,5 @@ if __name__ == "__main__":
     plot_history(history)
 
     # reconstruction_test()
+    # latent_space_interpolation_test()
+    # map_latent_space_to_grid()
