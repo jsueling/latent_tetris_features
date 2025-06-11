@@ -15,7 +15,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
 LATENT_DIM = 2
 GRID_SIZE = 200
-PIECE_CLASSES = 7
 NUM_EPOCHS = 200
 WARMUP_EPOCHS = 10 # Epochs to wait before early stopping may occur
 PATIENCE = 30 # Epochs to wait before early stopping after no improvement
@@ -24,20 +23,18 @@ CYCLE_LENGTH = 10
 class TetrisVAE(nn.Module):
     """
     Variational Autoencoder (VAE) for Tetris states.
-    This model encodes the game state (grid and piece type) into a latent space,
+    This model encodes the game state (grid) into a latent space,
     and decodes it back to reconstruct the original input.
     """
 
     def __init__(
             self,
             grid_size=200,
-            piece_classes=7,
             latent_dim=2,
         ):
 
         super(TetrisVAE, self).__init__()
         self.grid_size = grid_size
-        self.piece_classes = piece_classes
         self.latent_dim = latent_dim
 
         # Encoder
@@ -45,7 +42,7 @@ class TetrisVAE(nn.Module):
         encoder_dropout_rate = 0.1
 
         encoder_layers = []
-        input_dim = grid_size + piece_classes
+        input_dim = grid_size
         for output_dim in encoder_hidden_dims:
             encoder_layers.append(nn.Linear(input_dim, output_dim))
             encoder_layers.append(nn.ReLU())
@@ -72,9 +69,8 @@ class TetrisVAE(nn.Module):
 
         self.decoder = nn.Sequential(*decoder_layers)
 
-        # Multi-head output
+        # Output layer
         self.fc_grid = nn.Linear(decoder_hidden_dims[-1], grid_size)
-        self.fc_piece = nn.Linear(decoder_hidden_dims[-1], piece_classes)
 
     def encode(self, x):
         """Encodes the input into mean and variance vectors of the latent space vector z."""
@@ -92,26 +88,20 @@ class TetrisVAE(nn.Module):
     def decode(self, z):
         """
         Decodes the latent space vector z back to the original input space.
-        returns probabilities for reconstructed grid and
-        raw logits for the reconstructed piece.
+        returns logits of the reconstructed grid
         """
-        # Outputs raw logits
         z = self.decoder(z)
-        # Sigmoid converts to binary probabilities for grid reconstruction
-        grid_out = torch.sigmoid(self.fc_grid(z))
-        # return raw logits for piece classification
-        piece_logits = self.fc_piece(z)
-        return grid_out, piece_logits
+        return self.fc_grid(z)
 
     def forward(self, x, training=None):
         """
         Forward pass through the VAE
         """
-        # Ensure input is a batch of 1D feature lists (flattened grid + one-hot encoded piece)
+        # Ensure input is a batch of 1D feature lists (flattened grids)
         assert isinstance(x, torch.Tensor) and x.dim() == 2, \
             "Input must be a 2D tensor (batch_size, features)"
-        assert x.shape[1] == self.grid_size + self.piece_classes, \
-            f"Expected shape[1]: {self.grid_size + self.piece_classes}, got {x.shape[1]}"
+        assert x.shape[1] == self.grid_size, \
+            f"Expected shape[1]: {self.grid_size}, got {x.shape[1]}"
         assert training in [True, False], \
             "training must be set to True or False"
 
@@ -131,9 +121,9 @@ class TetrisVAE(nn.Module):
             z = z + 0.1 * torch.randn_like(z)
 
         # Decode reconstructions
-        grid_recon, piece_recon = self.decode(z)
+        grid_recon_logits = self.decode(z)
 
-        return grid_recon, piece_recon, z_mean, z_logvar
+        return grid_recon_logits, z_mean, z_logvar
 
 def save_model(model, path):
     """Saves the model state dictionary to the specified path."""
@@ -151,8 +141,7 @@ def encode_sample_to_latent(sample):
     return model(sample, training=False)
 
 def vae_loss(
-        grid_true, grid_recon,
-        piece_true, piece_recon,
+        grid_true, grid_recon_logits,
         z_mean, z_logvar,
         epoch
     ):
@@ -163,22 +152,13 @@ def vae_loss(
     # Totals per pixel_ce between each reconstructed grid and true grid
     # then divides over all dimensions (num_pixels * batch_size)
     # giving mean pixel_ce in the batch
-    pixel_bce = F.binary_cross_entropy(
-        grid_recon, grid_true, reduction='mean'
+    pixel_bce = F.binary_cross_entropy_with_logits(
+        grid_recon_logits, grid_true, reduction='mean'
     )
 
     # grid_bce = pixel_bce * grid_true.size(1) # Scale by number of pixels
 
-    # Piece reconstruction loss (categorical cross-entropy)
-
-    # Mean piece_ce per sample in the batch
-    piece_ce = F.cross_entropy(
-        piece_recon, # raw logits
-        torch.argmax(piece_true, dim=1),
-        reduction='mean'
-    )
-
-    reconstruction_loss = pixel_bce + piece_ce
+    reconstruction_loss = pixel_bce
 
     # KL Divergence loss
 
@@ -201,7 +181,7 @@ def vae_loss(
 
     elbo_loss = reconstruction_loss + kl_weight * kl_div_loss
 
-    return elbo_loss, pixel_bce, piece_ce, kl_div_loss
+    return elbo_loss, pixel_bce, kl_div_loss
 
 def train_model():
     """
@@ -230,7 +210,7 @@ def train_model():
     # Initialise model and optimiser
     model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
     encoder_params = list(model.encoder.parameters()) + list(model.fc_mean.parameters()) + list(model.fc_logvar.parameters())
-    decoder_params = list(model.decoder.parameters()) + list(model.fc_grid.parameters()) + list(model.fc_piece.parameters())
+    decoder_params = list(model.decoder.parameters()) + list(model.fc_grid.parameters())
     optimiser = torch.optim.Adam([
         {'params': encoder_params, 'weight_decay': 1e-5},
         {'params': decoder_params, 'weight_decay': 1e-4}
@@ -249,58 +229,49 @@ def train_model():
         # Training phase
         train_loss = 0
 
-        for batch in train_loader:
+        for grid_true in train_loader:
 
             optimiser.zero_grad()
 
-            grid_true, piece_true = batch[:, :-7], batch[:, -7:]
-            grid_recon, piece_recon, z_mean, z_logvar = model(batch, training=True)
+            batch_size = grid_true.size(0)
 
-            loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
-                grid_true, grid_recon,
-                piece_true, piece_recon,
+            grid_recon_logits, z_mean, z_logvar = model(grid_true, training=True)
+
+            loss, pixel_bce, kl_div_loss = vae_loss(
+                grid_true, grid_recon_logits,
                 z_mean, z_logvar,
                 epoch=epoch
             )
 
             loss.backward()
             optimiser.step()
-            train_loss += loss.item() * batch.size(0)
+            train_loss += loss.item() * batch_size
 
         # Validation phase
         validation_loss = 0
-        validation_correct_pieces = 0
         validation_correct_pixels = 0
         validation_pixel_bce = 0
-        validation_piece_ce = 0
         validation_kl_div_loss = 0
 
         with torch.no_grad():
-            for batch in validation_loader:
+            for grid_true in validation_loader:
 
-                grid_true, piece_true = batch[:, :-7], batch[:, -7:]
+                batch_size = grid_true.size(0)
 
-                grid_recon, piece_recon, z_mean, z_logvar = model(batch, training=False)
+                grid_recon_logits, z_mean, z_logvar = model(grid_true, training=False)
 
-                loss, pixel_bce, piece_ce, kl_div_loss = vae_loss(
-                    grid_true, grid_recon,
-                    piece_true, piece_recon,
+                loss, pixel_bce, kl_div_loss = vae_loss(
+                    grid_true, grid_recon_logits,
                     z_mean, z_logvar,
                     epoch=epoch
                 )
 
-                validation_pixel_bce += pixel_bce.item() * batch.size(0)
-                validation_piece_ce += piece_ce.item() * batch.size(0)
-                validation_kl_div_loss += kl_div_loss.item() * batch.size(0)
+                validation_pixel_bce += pixel_bce.item() * batch_size
+                validation_kl_div_loss += kl_div_loss.item() * batch_size
 
-                validation_loss += loss.item() * batch.size(0)
+                validation_loss += loss.item() * batch_size
 
-                piece_predictions = torch.argmax(F.softmax(piece_recon, dim=1), dim=1)
-                piece_truths = torch.argmax(piece_true, dim=1)
-                # Count correct predictions for piece classification
-                validation_correct_pieces += (piece_predictions == piece_truths).sum().item()
-
-                pixel_predictions = (grid_recon > 0.5).float()
+                pixel_predictions = (torch.sigmoid(grid_recon_logits) > 0.5).float()
                 # Count correct pixel predictions
                 validation_correct_pixels += (pixel_predictions == grid_true).float().sum().item()
 
@@ -308,18 +279,14 @@ def train_model():
         avg_train_loss = train_loss / training_samples
         avg_validation_loss = validation_loss / validation_samples
 
-        avg_piece_accuracy = validation_correct_pieces / validation_samples
         avg_pixel_accuracy = validation_correct_pixels / (validation_samples * GRID_SIZE)
         avg_pixel_bce = validation_pixel_bce / validation_samples
-        avg_piece_ce = validation_piece_ce / validation_samples
         avg_kl_div_loss = validation_kl_div_loss / validation_samples
 
         history['avg_train_loss'].append(avg_train_loss)
         history['avg_validation_loss'].append(avg_validation_loss)
-        history['avg_piece_accuracy'].append(avg_piece_accuracy)
         history['avg_pixel_accuracy'].append(avg_pixel_accuracy)
         history['avg_pixel_bce'].append(avg_pixel_bce)
-        history['avg_piece_ce'].append(avg_piece_ce)
         history['avg_kl_div_loss'].append(avg_kl_div_loss)
 
         # Update learning rate at the start of each cycle
@@ -363,21 +330,19 @@ def plot_history(history_dict):
 
     # Plot accuracies
     plt.subplot(2, 2, 2)
-    plt.plot(history_dict['avg_piece_accuracy'], label='Piece Accuracy')
     plt.plot(history_dict['avg_pixel_accuracy'], label='Pixel Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
-    plt.title('Piece and Pixel Accuracy')
+    plt.title('Pixel Accuracy')
     plt.legend()
     plt.grid(True)
 
     # Plot component losses
     plt.subplot(2, 2, 3)
     plt.plot(history_dict['avg_pixel_bce'], label='Pixel BCE')
-    plt.plot(history_dict['avg_piece_ce'], label='Piece CE')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Component Reconstruction Losses')
+    plt.title('Component Reconstruction Loss')
     plt.legend()
     plt.grid(True)
 
@@ -407,10 +372,9 @@ def reconstruction_test():
         true_sample = next(data_iterator)
 
         with torch.no_grad():
-            grid_recon, piece_recon, _, _ = model(true_sample, training=False)
-        piece = torch.zeros(1, 7)
-        piece[0, torch.argmax(F.softmax(piece_recon, dim=1), dim=1)] = 1
-        reconstructed_sample = torch.cat([(grid_recon > 0.5).float(), piece], dim=1)
+            grid_recon_logits, _, _ = model(true_sample, training=False)
+
+        reconstructed_sample = (torch.sigmoid(grid_recon_logits) > 0.5).float()
 
         print("True sample:")
         for row in true_sample:
@@ -424,7 +388,7 @@ def reconstruction_test():
         print("Reconstructed sample:")
         for row in reconstructed_sample:
             for col_idx, col_val in enumerate(row):
-                if col_idx <= 200 and col_idx % 10 == 0:
+                if col_idx % 10 == 0:
                     print()
                 print(int(col_val), end='')
             print()
@@ -450,12 +414,12 @@ def map_latent_space_to_grid():
     dataloader = DataLoader(subset, batch_size=128)
     with torch.no_grad():
         for sample in dataloader:
-            _, _, z_mean, z_logvar = model(sample, training=False)
+            _, z_mean, z_logvar = model(sample, training=False)
             z = model.reparameterise(z_mean, z_logvar)
             plt.scatter(z[:, 0].cpu(), z[:, 1].cpu(), alpha=0.5)
 
-    plt.xlabel('z0 (latent dimension 1)')
-    plt.ylabel('z1 (latent dimension 2)')
+    plt.xlabel('z[0] (latent dimension 1)')
+    plt.ylabel('z[1] (latent dimension 2)')
     plt.title('Latent Space Mapping of Tetris States')
     plt.grid(True)
     plt.savefig('./out/latent_space.png')
