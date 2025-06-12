@@ -13,12 +13,11 @@ import tetris_dataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
-LATENT_DIM = 2
+LATENT_DIM = 16
 GRID_SIZE = 200
 NUM_EPOCHS = 200
-WARMUP_EPOCHS = 10 # Epochs to wait before early stopping may occur
-PATIENCE = 30 # Epochs to wait before early stopping after no improvement
-CYCLE_LENGTH = 10
+WARMUP_EPOCHS = 50 # Epochs to wait before early stopping may occur
+PATIENCE = 20 # Epochs to wait before early stopping after no improvement
 
 class TetrisVAE(nn.Module):
     """
@@ -30,7 +29,7 @@ class TetrisVAE(nn.Module):
     def __init__(
             self,
             grid_size=200,
-            latent_dim=2,
+            latent_dim=16,
         ):
 
         super(TetrisVAE, self).__init__()
@@ -38,15 +37,14 @@ class TetrisVAE(nn.Module):
         self.latent_dim = latent_dim
 
         # Encoder
-        encoder_hidden_dims = [128, 64, 32]
-        encoder_dropout_rate = 0.1
+        encoder_hidden_dims = [512, 256, 128, 64, 32]
 
         encoder_layers = []
         input_dim = grid_size
         for output_dim in encoder_hidden_dims:
             encoder_layers.append(nn.Linear(input_dim, output_dim))
+            encoder_layers.append(nn.BatchNorm1d(output_dim))
             encoder_layers.append(nn.ReLU())
-            encoder_layers.append(nn.Dropout(encoder_dropout_rate))
             input_dim = output_dim
 
         self.encoder = nn.Sequential(*encoder_layers)
@@ -56,15 +54,14 @@ class TetrisVAE(nn.Module):
         self.fc_logvar = nn.Linear(encoder_hidden_dims[-1], latent_dim)
 
         # Decoder
-        decoder_hidden_dims = [32, 64]
-        decoder_dropout_rate = 0.5
+        decoder_hidden_dims = [32, 64, 128, 256]
 
         decoder_layers = []
         input_dim = latent_dim
         for output_dim in decoder_hidden_dims:
             decoder_layers.append(nn.Linear(input_dim, output_dim))
+            decoder_layers.append(nn.BatchNorm1d(output_dim))
             decoder_layers.append(nn.ReLU())
-            decoder_layers.append(nn.Dropout(decoder_dropout_rate))
             input_dim = output_dim
 
         self.decoder = nn.Sequential(*decoder_layers)
@@ -116,10 +113,6 @@ class TetrisVAE(nn.Module):
         # Reparameterisation trick
         z = self.reparameterise(z_mean, z_logvar)
 
-        if training:
-            # Add noise during training for robustness
-            z = z + 0.1 * torch.randn_like(z)
-
         # Decode reconstructions
         grid_recon_logits = self.decode(z)
 
@@ -156,28 +149,19 @@ def vae_loss(
         grid_recon_logits, grid_true, reduction='mean'
     )
 
-    # grid_bce = pixel_bce * grid_true.size(1) # Scale by number of pixels
-
     reconstruction_loss = pixel_bce
 
-    # KL Divergence loss
+    # Kullback-Leibler Divergence loss between the latent space distribution
+    # and the standard normal distribution N(0, 1)
 
-    kl_per_dim = -0.5 * (1 + z_logvar - z_mean.pow(2) - z_logvar.exp())
+    kl_div_loss = (-0.5 * torch.sum(
+        1 + z_logvar - z_mean.pow(2) - z_logvar.exp(),
+        dim=1 # Sum KLD over all latent dimensions
+    )).mean()  # Mean over batch
 
-    free_bits = 0.5
-    constrained_kl = torch.max(kl_per_dim, torch.tensor(free_bits, device=DEVICE))
-
-    # Sum KL divergence across latent dimensions then mean over batch
-    kl_div_loss = torch.sum(constrained_kl, dim=1).mean()
-
-    # KL weight strategy cycling between annealing and full KL phases
-    max_kl_weight = 1.0
-    if epoch % CYCLE_LENGTH < CYCLE_LENGTH // 2:
-        # Annealing phase
-        kl_weight = (epoch % (CYCLE_LENGTH // 2)) / (CYCLE_LENGTH // 2) * max_kl_weight
-    else:
-        # Full KL phase
-        kl_weight = max_kl_weight
+    # KL weight is scaled linearly during the warmup phase to allow the model
+    # to learn to reconstruct inputs well before regularising the latent space
+    kl_weight = 1e-3 * min(epoch / WARMUP_EPOCHS, 1.0)
 
     elbo_loss = reconstruction_loss + kl_weight * kl_div_loss
 
@@ -209,13 +193,12 @@ def train_model():
 
     # Initialise model and optimiser
     model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
-    encoder_params = list(model.encoder.parameters()) + list(model.fc_mean.parameters()) + list(model.fc_logvar.parameters())
-    decoder_params = list(model.decoder.parameters()) + list(model.fc_grid.parameters())
-    optimiser = torch.optim.Adam([
-        {'params': encoder_params, 'weight_decay': 1e-5},
-        {'params': decoder_params, 'weight_decay': 1e-4}
-        ], lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=1, factor=0.5)
+
+    # Adam optimiser with learning rate scheduling
+    # to reduce the learning rate when validation loss plateaus
+    # and L2 regularisation to prevent overfitting
+    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=3, factor=0.5)
 
     epochs_no_improvement = 0
     history = defaultdict(list)
@@ -289,15 +272,15 @@ def train_model():
         history['avg_pixel_bce'].append(avg_pixel_bce)
         history['avg_kl_div_loss'].append(avg_kl_div_loss)
 
-        # Update learning rate at the start of each cycle
-        if epoch > 0 and epoch % CYCLE_LENGTH == 0:
-            scheduler.step(avg_validation_loss)
-
         # Save history every epoch
         np.save("./out/tetris_vae_history.npy", history)
 
+        # Skip early stopping and learning rate scheduling during warmup
         if epoch <= WARMUP_EPOCHS:
             continue
+
+        # Learning rate scheduling
+        scheduler.step(avg_validation_loss)
 
         # Early stopping check
         if avg_validation_loss < best_validation_loss:
@@ -379,7 +362,7 @@ def reconstruction_test():
         print("True sample:")
         for row in true_sample:
             for col_idx, col_val in enumerate(row):
-                if col_idx <= 200 and col_idx % 10 == 0:
+                if col_idx % 10 == 0:
                     print()
                 print(int(col_val), end='')
             print()
