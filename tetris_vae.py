@@ -127,12 +127,6 @@ def load_model(model, path):
     model.load_state_dict(torch.load(path))
     return model
 
-def encode_sample_to_latent(sample):
-    """Maps input sample to latent space"""
-    model = TetrisVAE().to(DEVICE)
-    model = load_model(model, "./out/best_model.pth")
-    return model(sample, training=False)
-
 def vae_loss(
         grid_true, grid_recon_logits,
         z_mean, z_logvar,
