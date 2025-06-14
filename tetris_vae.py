@@ -13,8 +13,10 @@ import tetris_dataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
-LATENT_DIM = 16
+LATENT_DIM = 8
 GRID_SIZE = 200
+GRID_HEIGHT = 20
+GRID_WIDTH = 10
 NUM_EPOCHS = 200
 WARMUP_EPOCHS = 50 # Epochs to wait before early stopping may occur
 PATIENCE = 20 # Epochs to wait before early stopping after no improvement
@@ -29,7 +31,7 @@ class TetrisVAE(nn.Module):
     def __init__(
             self,
             grid_size=200,
-            latent_dim=16,
+            latent_dim=8,
         ):
 
         super(TetrisVAE, self).__init__()
@@ -152,6 +154,8 @@ def vae_loss(
         1 + z_logvar - z_mean.pow(2) - z_logvar.exp(),
         dim=1 # Sum KLD over all latent dimensions
     )).mean()  # Mean over batch
+
+    # 1e-3, 2e-3, 5e-3, 1e-2 : 0.2, 0.4, 1.0, 2.0 Possible choices for effective beta values
 
     # KL weight is scaled linearly during the warmup phase to allow the model
     # to learn to reconstruct inputs well before regularising the latent space
@@ -288,10 +292,13 @@ def train_model():
 
     return history, epoch
 
-def plot_history(history_dict):
+def plot_history(history_dict=None):
     """
     Plots the training history of the VAE model.
     """
+
+    if history_dict is None:
+        history_dict = np.load("./out/tetris_vae_history.npy", allow_pickle=True).item()
 
     plt.figure(figsize=(15, 12))
 
@@ -336,16 +343,17 @@ def plot_history(history_dict):
     plt.savefig('./out/training_history.png')
     plt.show()
 
-def reconstruction_test():
+def reconstruction_test(model, dataset):
     """
     Tests the reconstruction quality of Tetris states using the trained VAE model.
     """
-    model = TetrisVAE().to(DEVICE)
-    model = load_model(model, "./out/best_model.pth")
-    data_loader = DataLoader(tetris_dataset.TetrisDataset(device=DEVICE), shuffle=True)
+
+    data_loader = DataLoader(dataset, shuffle=True)
     data_iterator = iter(data_loader)
 
-    for _ in range(10):
+    num_tests = 10
+
+    for _ in range(num_tests):
         true_sample = next(data_iterator)
 
         with torch.no_grad():
@@ -354,22 +362,12 @@ def reconstruction_test():
         reconstructed_sample = (torch.sigmoid(grid_recon_logits) > 0.5).float()
 
         print("True sample:")
-        for row in true_sample:
-            for col_idx, col_val in enumerate(row):
-                if col_idx % 10 == 0:
-                    print()
-                print(int(col_val), end='')
-            print()
-            print("-"*20)
+        true_sample = true_sample.int().detach().numpy().reshape(GRID_HEIGHT, GRID_WIDTH)
+        print(true_sample)
 
         print("Reconstructed sample:")
-        for row in reconstructed_sample:
-            for col_idx, col_val in enumerate(row):
-                if col_idx % 10 == 0:
-                    print()
-                print(int(col_val), end='')
-            print()
-            print("-"*20)
+        reconstructed_sample = reconstructed_sample.int().detach().numpy().reshape(GRID_HEIGHT, GRID_WIDTH)
+        print(reconstructed_sample)
 
 def latent_space_interpolation_test():
     """
@@ -377,15 +375,72 @@ def latent_space_interpolation_test():
     """
     pass
 
-def map_latent_space_to_grid():
+def latent_space_traversal(model, dataset):
+    """
+    Tests for disentangled latent representations created by the VAE by
+    visually comparing a single sample which is perturbed along each latent dimension.
+    """
+    data_loader = DataLoader(dataset, shuffle=True)
+    data_iterator = iter(data_loader)
+
+    sample = next(data_iterator) # 200 dimensional Tetris state
+
+    num_samples_per_dimension = 11 # Number of samples per dimension
+    perturbation_range = 3.0 # Range of perturbation to vary each latent dimension
+    all_dimension_samples = []
+
+    with torch.no_grad():
+        _, z_mean, _ = model(sample, training=False)
+
+    for dim_index in range(LATENT_DIM):
+
+        dimension_samples = []
+
+        # Create a grid of latent space vectors by varying one dimension
+        for perturbation_value in np.linspace(
+            -perturbation_range,
+            perturbation_range,
+            num=num_samples_per_dimension
+        ):
+            z_modified = z_mean.clone()
+            z_modified[:, dim_index] += perturbation_value
+            grid_recon_logits = model.decode(z_modified).squeeze(0)
+            reconstructed_sample = (torch.sigmoid(grid_recon_logits) > 0.5).float()
+            reconstructed_sample = reconstructed_sample.detach().numpy().reshape(GRID_HEIGHT, GRID_WIDTH)
+            dimension_samples.append(grid_recon_logits.detach().numpy().reshape(GRID_HEIGHT, GRID_WIDTH))
+
+        all_dimension_samples.append(dimension_samples)
+
+    # Visualise the reconstructed samples for each dimension
+    _, axes = plt.subplots(
+        LATENT_DIM,
+        num_samples_per_dimension,
+        figsize=(num_samples_per_dimension * 2, LATENT_DIM * 1.5)
+    )
+
+    for dim_index in range(LATENT_DIM):
+        for sample_index in range(num_samples_per_dimension):
+            ax = axes[dim_index, sample_index]
+            ax.imshow(
+                all_dimension_samples[dim_index][sample_index],
+                cmap='Blues',
+                interpolation='nearest',
+                vmin=0,
+                vmax=1
+            )
+            ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig('./out/latent_space_traversal.png')
+    plt.show()
+
+def map_latent_space_to_grid(model, dataset):
     """
     Maps the latent space of the VAE model to visualise in 2d.
     """
-    model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
-    model = load_model(model, "./out/best_model.pth")
+
     plt.figure(figsize=(15, 12))
 
-    dataset = tetris_dataset.TetrisDataset(device=DEVICE)
     indices = torch.randperm(len(dataset))[:10000]
     subset = torch.utils.data.Subset(dataset, indices)
     dataloader = DataLoader(subset, batch_size=128)
@@ -413,8 +468,12 @@ if __name__ == "__main__":
 
     print(f"Training completed after {epochs} epochs.")
 
-    plot_history(history)
+    plot_history()
 
-    # reconstruction_test()
-    # latent_space_interpolation_test()
-    # map_latent_space_to_grid()
+    # vae_model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
+    # vae_model = load_model(vae_model, "./out/best_model.pth")
+    # data = tetris_dataset.TetrisDataset(device=DEVICE)
+
+    # reconstruction_test(vae_model, data)
+    # map_latent_space_to_grid(vae_model, data)
+    # latent_space_traversal(vae_model, data)

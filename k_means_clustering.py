@@ -13,7 +13,7 @@ from tetris_vae import TetrisVAE, load_model
 from tetris_dataset import TetrisDataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LATENT_DIM = 16
+LATENT_DIM = 8
 
 def elbow_plot(data, min_k=2, max_k=40):
     """
@@ -176,9 +176,9 @@ if __name__ == "__main__":
         latent_samples = np.concatenate(latent_samples, axis=0)
 
     # Determining the optimal number of clusters: https://uc-r.github.io/kmeans_clustering#gap
-    elbow_plot(latent_samples, min_k=2, max_k=int(0.5 * len(latent_samples)) + 1)
-    avg_silhouette(latent_samples, min_k=2, max_k=int(0.5 * len(latent_samples)) + 1)
-    gap_statistic(latent_samples, min_k=2, max_k=int(0.5 * len(latent_samples)) + 1)
+    elbow_plot(latent_samples, min_k=2, max_k=int(len(latent_samples) ** 0.5) + 1)
+    avg_silhouette(latent_samples, min_k=2, max_k=int(len(latent_samples) ** 0.5) + 1)
+    gap_statistic(latent_samples, min_k=2, max_k=int(len(latent_samples) ** 0.5) + 1)
 
     # Using the optimal clusters determined from the above methods
     visualise_centroids(latent_samples, vae_model, k=25)
