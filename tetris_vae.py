@@ -155,7 +155,8 @@ def vae_loss(
         dim=1 # Sum KLD over all latent dimensions
     )).mean()  # Mean over batch
 
-    # 1e-3, 2e-3, 5e-3, 1e-2 : 0.2, 0.4, 1.0, 2.0 Possible choices for effective beta values
+    # Effective beta values since pixel_bce should be scaled by GRID_SIZE
+    # 1e-3, 2e-3, 5e-3, 1e-2, 2e-2 : 0.2, 0.4, 1.0, 2.0, 4.0
 
     # KL weight is scaled linearly during the warmup phase to allow the model
     # to learn to reconstruct inputs well before regularising the latent space
@@ -379,14 +380,19 @@ def latent_space_traversal(model, dataset):
     """
     Tests for disentangled latent representations created by the VAE by
     visually comparing a single sample which is perturbed along each latent dimension.
+    As found in Fig 7 of the beta-VAE paper: https://openreview.net/forum?id=Sy2fzU9gl
     """
     data_loader = DataLoader(dataset, shuffle=True)
     data_iterator = iter(data_loader)
 
     sample = next(data_iterator) # 200 dimensional Tetris state
 
-    num_samples_per_dimension = 11 # Number of samples per dimension
-    perturbation_range = 3.0 # Range of perturbation to vary each latent dimension
+    # "3 standard deviations around the unit gaussian prior
+    # while keeping the remaining latent units fixed"
+    # Fig 7, https://openreview.net/forum?id=Sy2fzU9gl
+    num_samples_per_dimension = 7
+    perturbation_range = 3.0
+
     all_dimension_samples = []
 
     with torch.no_grad():
@@ -415,7 +421,7 @@ def latent_space_traversal(model, dataset):
     _, axes = plt.subplots(
         LATENT_DIM,
         num_samples_per_dimension,
-        figsize=(num_samples_per_dimension * 2, LATENT_DIM * 1.5)
+        figsize=(num_samples_per_dimension, LATENT_DIM * 1.5)
     )
 
     for dim_index in range(LATENT_DIM):
@@ -436,22 +442,45 @@ def latent_space_traversal(model, dataset):
 
 def map_latent_space_to_grid(model, dataset):
     """
-    Maps the latent space of the VAE model to visualise in 2d.
+    Maps the latent space of the VAE model to visualise in 2d or 3d.
     """
 
+    if LATENT_DIM not in [2, 3]:
+        print(f"Latent space visualisation is only supported for LATENT_DIM 2 or 3. \
+              Current LATENT_DIM is {LATENT_DIM}.")
+        return
+
     plt.figure(figsize=(15, 12))
+    ax = plt.axes(projection='3d' if LATENT_DIM == 3 else None)
 
     indices = torch.randperm(len(dataset))[:10000]
     subset = torch.utils.data.Subset(dataset, indices)
     dataloader = DataLoader(subset, batch_size=128)
+    all_z = []
     with torch.no_grad():
         for sample in dataloader:
             _, z_mean, z_logvar = model(sample, training=False)
             z = model.reparameterise(z_mean, z_logvar)
-            plt.scatter(z[:, 0].cpu(), z[:, 1].cpu(), alpha=0.5)
+            all_z.append(z)
 
-    plt.xlabel('z[0] (latent dimension 1)')
-    plt.ylabel('z[1] (latent dimension 2)')
+    all_z = torch.cat(all_z, dim=0)
+
+    if LATENT_DIM == 3:
+        ax.scatter3D(
+            all_z[:, 0], all_z[:, 1], all_z[:, 2],
+            alpha=0.5, c=all_z[:, 2], cmap='viridis'
+        )
+        ax.set_xlabel('z[0] (latent dimension 1)')
+        ax.set_ylabel('z[1] (latent dimension 2)')
+        ax.set_zlabel('z[2] (latent dimension 3)')
+    else: # LATENT_DIM == 2
+        ax.scatter(
+            all_z[:, 0], all_z[:, 1],
+            alpha=0.5, c=all_z[:, 1], cmap='viridis'
+        )
+        ax.set_xlabel('z[0] (latent dimension 1)')
+        ax.set_ylabel('z[1] (latent dimension 2)')
+
     plt.title('Latent Space Mapping of Tetris States')
     plt.grid(True)
     plt.savefig('./out/latent_space.png')

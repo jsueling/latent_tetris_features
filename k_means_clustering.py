@@ -15,14 +15,14 @@ from tetris_dataset import TetrisDataset
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LATENT_DIM = 8
 
-def elbow_plot(data, min_k=2, max_k=40):
+def elbow_plot(data, min_k=2, max_k=40, seed=0):
     """
     Generates an elbow plot for determining the optimal number of clusters in K-Means clustering.
     """
 
     inertias = []
     for k in range(min_k, max_k + 1):
-        kmeans = KMeans(n_clusters=k)
+        kmeans = KMeans(n_clusters=k, random_state=seed)
         kmeans.fit(data)
         inertias.append(kmeans.inertia_)
 
@@ -33,7 +33,7 @@ def elbow_plot(data, min_k=2, max_k=40):
     plt.savefig('./out/elbow_plot.png')
     plt.show()
 
-def avg_silhouette(data, min_k=2, max_k=40):
+def avg_silhouette(data, min_k=2, max_k=40, seed=0):
     """Suggests optimal k value based on average silhouette score for a range of k values."""
 
     silhouette_avgs = []
@@ -41,7 +41,7 @@ def avg_silhouette(data, min_k=2, max_k=40):
 
     # Calculate avg silhouette scores for each k
     for k in n_clusters:
-        clusterer = KMeans(n_clusters=k, random_state=10)
+        clusterer = KMeans(n_clusters=k, random_state=seed)
         cluster_labels = clusterer.fit_predict(data)
         silhouette_avg = silhouette_score(data, cluster_labels)
         silhouette_avgs.append(silhouette_avg)
@@ -55,7 +55,7 @@ def avg_silhouette(data, min_k=2, max_k=40):
     plt.savefig('./out/avg_silhouette.png')
     plt.show()
 
-def gap_statistic(data, min_k=2, max_k=40, num_ref_datasets=10):
+def gap_statistic(data, min_k=2, max_k=40, num_ref_datasets=10, seed=0):
     """
     Compares within-cluster dispersion to random reference distribution
     for multiple values of k. Large gap values indicate that the clustering structure
@@ -63,7 +63,7 @@ def gap_statistic(data, min_k=2, max_k=40, num_ref_datasets=10):
     """
 
     def compute_inertia(data, k):
-        kmeans = KMeans(n_clusters=k, random_state=42)
+        kmeans = KMeans(n_clusters=k, random_state=seed)
         kmeans.fit(data)
         return kmeans.inertia_
 
@@ -105,20 +105,21 @@ def gap_statistic(data, min_k=2, max_k=40, num_ref_datasets=10):
     plt.show()
     return gaps
 
-def visualise_centroids(data, model, k=20, n_samples=8):
+def visualise_centroids(data, model, k=20, n_samples=8, seed=0):
     """Visualizes the centroids of the clusters in the latent space."""
-    kmeans = KMeans(n_clusters=k, random_state=42)
+    kmeans = KMeans(n_clusters=k, random_state=seed)
     kmeans.fit(data)
     centroids = kmeans.cluster_centers_
 
     all_centroid_samples = []
-    noise_scale = 3
+    noise_scale = 1.0
 
     for centroid in centroids:
 
         # Generate noisy samples around the centroid
         centroid_samples = []
         for _ in range(n_samples):
+            # Add Gaussian noise to the centroid in each dimension
             noise = np.random.normal(0, noise_scale, size=centroid.shape)
             noisy_centroid = centroid + noise
             centroid_samples.append(noisy_centroid)
@@ -140,28 +141,53 @@ def visualise_centroids(data, model, k=20, n_samples=8):
         # all_centroid_samples.append(reconstructed_grids)
 
     # Visualise the reconstructed centroid samples
-    _, axes = plt.subplots(n_samples, k, figsize=(k * 2, n_samples * 1.5))
+    _, axes = plt.subplots(nrows=k, ncols=n_samples, figsize=(n_samples * 2, k * 2))
     for centroid_index in range(k):
         for sample_index in range(n_samples):
-            axes[sample_index, centroid_index].imshow(
+            axes[centroid_index, sample_index].imshow(
                 all_centroid_samples[centroid_index][sample_index].reshape(20, 10),
-                cmap='Reds',
+                cmap='Blues',
                 vmin=0,
                 vmax=1,
                 interpolation='nearest'
             )
-            axes[sample_index, centroid_index].axis('off')
-    plt.savefig('./out/centroids.png')
+            if sample_index == 0:
+                axes[centroid_index, sample_index].set_ylabel(
+                    f"Cluster {centroid_index+1}", fontsize=12, rotation=0, labelpad=40, va='center'
+                )
+                axes[centroid_index, sample_index].set_xticks([])
+                axes[centroid_index, sample_index].set_yticks([])
+                axes[centroid_index, sample_index].spines['top'].set_visible(False)
+                axes[centroid_index, sample_index].spines['right'].set_visible(False)
+                axes[centroid_index, sample_index].spines['bottom'].set_visible(False)
+                axes[centroid_index, sample_index].spines['left'].set_visible(False)
+            else:
+                axes[centroid_index, sample_index].axis('off')
+
+    for sample_index in range(n_samples):
+        axes[0, sample_index].set_title(f"Sample {sample_index+1}", fontsize=12, pad=10)
+
+    plt.suptitle(
+        f"Visualising the centroids of the Tetris state latent "
+        f"space with added Gaussian noise. "
+        f"\nClusters are found using K-means clustering "
+        f"(k={k}, Sample size={n_samples}, Noise scale={noise_scale})",
+        fontsize=20
+    )
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.95)
+    plt.savefig(f'./out/noisy_centroids_clusters_{k}_noise_scale_{noise_scale}.png')
     plt.show()
 
 if __name__ == "__main__":
     # Set random seed for reproducibility
-    torch.manual_seed(0)
-    np.random.seed(0)
-    random.seed(0)
+    RANDOM_SEED = 0
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
 
     vae_model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
-    vae_model = load_model(vae_model, "./out/best_model.pth")
+    vae_model = load_model(vae_model, "./out/model_8dim_1e-3.pth")
     dataset = TetrisDataset(device=DEVICE)
     # Sample a subset of the dataset for clustering
     indices = torch.randperm(len(dataset))[:10000]
@@ -176,9 +202,12 @@ if __name__ == "__main__":
         latent_samples = np.concatenate(latent_samples, axis=0)
 
     # Determining the optimal number of clusters: https://uc-r.github.io/kmeans_clustering#gap
-    elbow_plot(latent_samples, min_k=2, max_k=int(len(latent_samples) ** 0.5) + 1)
-    avg_silhouette(latent_samples, min_k=2, max_k=int(len(latent_samples) ** 0.5) + 1)
-    gap_statistic(latent_samples, min_k=2, max_k=int(len(latent_samples) ** 0.5) + 1)
+    max_k = int(len(latent_samples) ** 0.5) + 1
+    elbow_plot(latent_samples, min_k=2, max_k=max_k, seed=RANDOM_SEED)
+    avg_silhouette(latent_samples, min_k=2, max_k=max_k, seed=RANDOM_SEED)
+    gap_statistic(latent_samples, min_k=2, max_k=max_k, seed=RANDOM_SEED)
 
-    # Using the optimal clusters determined from the above methods
-    visualise_centroids(latent_samples, vae_model, k=25)
+    # Informed by clustering methods and visual inspection
+    K_CLUSTERS = 22
+
+    visualise_centroids(latent_samples, vae_model, k=K_CLUSTERS, seed=RANDOM_SEED)
