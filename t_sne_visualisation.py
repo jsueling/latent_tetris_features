@@ -8,7 +8,7 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader
 
-from tetris_vae import TetrisVAE, load_model
+from tetris_vae_mlp import TetrisVAE, load_model
 from tetris_dataset import TetrisDataset
 
 LATENT_DIM = 8

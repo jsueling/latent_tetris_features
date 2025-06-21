@@ -34,7 +34,8 @@ class TetrisDataset(Dataset):
             for sample in data:
                 assert sample.shape == (207,), \
                     f"Expected sample shape (207,), got {sample.shape}"
-                self.samples.append(sample[:200])
+                grid = sample[:200].reshape(1, 20, 10)
+                self.samples.append(grid)
 
     def __len__(self):
         return len(self.samples)
