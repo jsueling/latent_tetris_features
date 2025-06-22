@@ -9,8 +9,9 @@ from sklearn.metrics import silhouette_score
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-from tetris_vae_mlp import TetrisVAE, load_model
+from tetris_vae_convolutional import TetrisVAE
 from tetris_dataset import TetrisDataset
+import tetris_vae_utils as utils
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LATENT_DIM = 8
@@ -186,8 +187,10 @@ if __name__ == "__main__":
     np.random.seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
 
+    model_path = "../out/dim_8_max_kld_1.0.pth"
+
     vae_model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
-    vae_model = load_model(vae_model, "./out/model_8dim_1e-3.pth")
+    vae_model = utils.load_model(vae_model, model_path)
     dataset = TetrisDataset(device=DEVICE)
     # Sample a subset of the dataset for clustering
     indices = torch.randperm(len(dataset))[:10000]
