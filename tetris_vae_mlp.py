@@ -14,6 +14,7 @@ import tetris_vae_utils as utils
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
 LATENT_DIM = 8
+MAX_KLD_WEIGHT = 0.2
 GRID_SIZE = 200
 GRID_HEIGHT = 20
 GRID_WIDTH = 10
@@ -21,9 +22,9 @@ NUM_EPOCHS = 200
 WARMUP_EPOCHS = 50 # Epochs to wait before early stopping may occur
 PATIENCE = 20 # Epochs to wait before early stopping after no improvement
 
-class TetrisVAE(nn.Module):
+class TetrisMultilayerPerceptronVAE(nn.Module):
     """
-    Variational Autoencoder (VAE) for Tetris states.
+    Variational Autoencoder (VAE) for Tetris states using a multilayer perceptron architecture (MLP).
     This model encodes the game state (grid) into a latent space,
     and decodes it back to reconstruct the original input.
     """
@@ -34,7 +35,7 @@ class TetrisVAE(nn.Module):
             latent_dim=8,
         ):
 
-        super(TetrisVAE, self).__init__()
+        super(TetrisMultilayerPerceptronVAE, self).__init__()
         self.grid_size = grid_size
         self.latent_dim = latent_dim
 
@@ -123,7 +124,8 @@ class TetrisVAE(nn.Module):
 def vae_loss(
         grid_true, grid_recon_logits,
         z_mean, z_logvar,
-        epoch
+        epoch,
+        max_kld_weight=MAX_KLD_WEIGHT,
     ):
     """Computes the loss for the VAE model. Returns losses per sample of this batch"""
 
@@ -136,7 +138,9 @@ def vae_loss(
         grid_recon_logits, grid_true, reduction='mean'
     )
 
-    reconstruction_loss = pixel_bce
+    # As there are GRID_SIZE pixels in each grid, we multiply by the mean pixel_bce
+    # to get the total reconstruction loss per grid sample
+    reconstruction_loss = pixel_bce * GRID_SIZE
 
     # Kullback-Leibler Divergence loss between the latent space distribution
     # and the standard normal distribution N(0, 1)
@@ -146,12 +150,9 @@ def vae_loss(
         dim=1 # Sum KLD over all latent dimensions
     )).mean()  # Mean over batch
 
-    # Effective beta values since pixel_bce should be scaled by GRID_SIZE
-    # 1e-3, 2e-3, 5e-3, 1e-2, 2e-2 : 0.2, 0.4, 1.0, 2.0, 4.0
-
     # KL weight is scaled linearly during the warmup phase to allow the model
     # to learn to reconstruct inputs well before regularising the latent space
-    kl_weight = 1e-3 * min(epoch / WARMUP_EPOCHS, 1.0)
+    kl_weight = max_kld_weight * min(epoch / WARMUP_EPOCHS, 1.0)
 
     elbo_loss = reconstruction_loss + kl_weight * kl_div_loss
 
@@ -182,7 +183,7 @@ def train_model():
     )
 
     # Initialise model and optimiser
-    model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
+    model = TetrisMultilayerPerceptronVAE(latent_dim=LATENT_DIM).to(DEVICE)
 
     # Adam optimiser with learning rate scheduling
     # to reduce the learning rate when validation loss plateaus
@@ -213,7 +214,8 @@ def train_model():
             loss, pixel_bce, kl_div_loss = vae_loss(
                 grid_true, grid_recon_logits,
                 z_mean, z_logvar,
-                epoch=epoch
+                epoch=epoch,
+                max_kld_weight=MAX_KLD_WEIGHT
             )
 
             loss.backward()
@@ -236,7 +238,8 @@ def train_model():
                 loss, pixel_bce, kl_div_loss = vae_loss(
                     grid_true, grid_recon_logits,
                     z_mean, z_logvar,
-                    epoch=epoch
+                    epoch=epoch,
+                    max_kld_weight=MAX_KLD_WEIGHT
                 )
 
                 validation_pixel_bce += pixel_bce.item() * batch_size
@@ -297,10 +300,15 @@ if __name__ == "__main__":
 
     utils.plot_history(history_file_path)
 
-    vae_model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
+    vae_model = TetrisMultilayerPerceptronVAE(latent_dim=LATENT_DIM).to(DEVICE)
     vae_model = utils.load_model(vae_model, model_file_path)
     data = tetris_dataset.TetrisDataset(device=DEVICE)
 
     utils.reconstruction_test(vae_model, data)
     utils.map_latent_space_to_grid(vae_model, data, latent_dim=LATENT_DIM)
-    utils.latent_space_traversal(vae_model, data, latent_dim=LATENT_DIM)
+    utils.latent_space_traversal(
+        vae_model,
+        data,
+        latent_dim=LATENT_DIM,
+        max_kld_weight=MAX_KLD_WEIGHT
+    )

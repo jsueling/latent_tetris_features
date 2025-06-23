@@ -23,9 +23,9 @@ NUM_EPOCHS = 200
 WARMUP_EPOCHS = 1 # Epochs to wait before early stopping may occur
 PATIENCE = 0 # Epochs to wait before early stopping after no improvement
 
-class TetrisVAE(nn.Module):
+class TetrisConvolutionalVAE(nn.Module):
     """
-    Variational Autoencoder (VAE) for Tetris states.
+    Variational Autoencoder (VAE) for Tetris states using a convolutional architecture.
     This model encodes the game state (grid) into a latent space,
     and decodes it back to reconstruct the original input.
     """
@@ -37,7 +37,7 @@ class TetrisVAE(nn.Module):
             latent_dim=LATENT_DIM,
         ):
 
-        super(TetrisVAE, self).__init__()
+        super(TetrisConvolutionalVAE, self).__init__()
         self.grid_height = grid_height
         self.grid_width = grid_width
         self.latent_dim = latent_dim
@@ -63,7 +63,7 @@ class TetrisVAE(nn.Module):
 
         self.encoder = nn.Sequential(*encoder_layers)
 
-        # Calculate the flattened size dynamically after convolutions
+        # Calculate the flattened encoder output size dynamically after convolutions
         with torch.no_grad():
             dummy_input = torch.zeros(1, 1, self.grid_height, self.grid_width)
             dummy_output = self.encoder(dummy_input)
@@ -77,7 +77,7 @@ class TetrisVAE(nn.Module):
         # Decoder
         decoder_channels = [256, 128, 64]
 
-        # Projection from latent space to the shape of the first decoder layer
+        # Maps from latent space to the number of features of the first decoder layer
         self.fc_decode = nn.Linear(latent_dim, self.conv_output_size)
 
         decoder_layers = []
@@ -112,7 +112,7 @@ class TetrisVAE(nn.Module):
     def encode(self, x):
         """Encodes the input into mean and variance vectors of the latent space vector z."""
         x = self.encoder(x)
-        x = x.flatten(start_dim=1)  # Flatten the output
+        x = x.flatten(start_dim=1)  # Flatten the convolutional encoder output
         z_mean = self.fc_mean(x)
         z_logvar = self.fc_logvar(x)
         return z_mean, z_logvar
@@ -128,8 +128,11 @@ class TetrisVAE(nn.Module):
         Decodes the latent space vector z back to the original input space.
         returns logits of the reconstructed grid
         """
+        # Preprocess z for decoding - expand latent_dim to flattened conv_output_size
         z = self.fc_decode(z)
+        # Reshape z to match the output shape of the last convolutional layer
         z = z.view(-1, *self.conv_output_shape)
+        # Invert the convolutional layers to reconstruct the grid
         z = self.decoder(z)
         return z
 
@@ -181,10 +184,11 @@ def vae_loss(
         grid_recon_logits, grid_true, reduction='mean'
     )
 
-    # Scale up reconstruction loss by the number of pixels in the grid
+    # As there are GRID_SIZE pixels in each grid, we multiply by the mean pixel_bce
+    # to get the total reconstruction loss per grid sample
     reconstruction_loss = pixel_bce * GRID_SIZE
 
-    # Kullback-Leibler Divergence loss between the latent space distribution
+    # Kullback-Leibler Divergence loss between the current latent space distribution
     # and the standard normal distribution N(0, 1)
 
     kl_div_loss = (-0.5 * torch.sum(
@@ -211,7 +215,7 @@ def train_model(
     """
 
     # Initialise model and optimiser
-    model = TetrisVAE(latent_dim=latent_dim).to(DEVICE)
+    model = TetrisConvolutionalVAE(latent_dim=latent_dim).to(DEVICE)
 
     # Adam optimiser with learning rate scheduling
     # to reduce the learning rate when validation loss plateaus
@@ -351,14 +355,14 @@ if __name__ == "__main__":
                 validation_loader=validation_loader
             )
 
-    latent_dim = 16
-    kld_weight = 2.0
+    latent_dim = 8
+    kld_weight = 1.25
     history_file_path = f"../out/dim_{latent_dim}_max_kld_{kld_weight}.npy"
     model_file_path = f"../out/dim_{latent_dim}_max_kld_{kld_weight}.pth"
 
     utils.plot_history(history_file_path)
 
-    vae_model = TetrisVAE(latent_dim=latent_dim).to(DEVICE)
+    vae_model = TetrisConvolutionalVAE(latent_dim=latent_dim).to(DEVICE)
     vae_model = utils.load_model(vae_model, model_file_path)
     data = tetris_dataset.TetrisDataset(device=DEVICE)
 

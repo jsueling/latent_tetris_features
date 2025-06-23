@@ -7,8 +7,10 @@ from torch.utils.data import DataLoader
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LATENT_DIM = 8
+MAX_KLD_WEIGHT = 1.0
 GRID_HEIGHT = 20
 GRID_WIDTH = 10
+BATCH_SIZE = 128
 
 def plot_history(history_file_path=None):
     """
@@ -92,7 +94,7 @@ def latent_space_interpolation_test():
     """
     pass
 
-def latent_space_traversal(model, dataset, latent_dim=LATENT_DIM):
+def latent_space_traversal(model, dataset, latent_dim=LATENT_DIM, max_kld_weight=MAX_KLD_WEIGHT):
     """
     Tests for disentangled latent representations created by the VAE by
     visually comparing a single sample which is perturbed along each latent dimension.
@@ -150,10 +152,43 @@ def latent_space_traversal(model, dataset, latent_dim=LATENT_DIM):
                 vmin=0,
                 vmax=1
             )
-            ax.axis('off')
 
+            if sample_index == 0:
+                axes[dim_index, sample_index].set_ylabel(
+                    f"Latent Dim {dim_index+1}", fontsize=12, rotation=0, labelpad=40, va='center'
+                )
+                axes[dim_index, sample_index].set_xticks([])
+                axes[dim_index, sample_index].set_yticks([])
+                axes[dim_index, sample_index].spines['top'].set_visible(False)
+                axes[dim_index, sample_index].spines['right'].set_visible(False)
+                axes[dim_index, sample_index].spines['bottom'].set_visible(False)
+                axes[dim_index, sample_index].spines['left'].set_visible(False)
+            else:
+                axes[dim_index, sample_index].axis('off')
+
+    # n points on line, n-1 segments between them
+    segment_count = num_samples_per_dimension - 1
+    total_perturbation_range = perturbation_range * 2
+    segment_size = total_perturbation_range / segment_count
+    for sample_index in range(num_samples_per_dimension):
+        std = np.round(abs(-perturbation_range + segment_size * sample_index), 2)
+        axes[0, sample_index].set_title(
+            f"{'-' if sample_index < num_samples_per_dimension // 2 else '+'}{std}",
+            fontsize=12,
+            pad=10
+        )
+
+    plt.suptitle(
+        f"Latent Space Traversal: Effect of varying each latent dimension on the\n"
+        f"decoded grid. Each row shows reconstructions of the same single Tetris\n"
+        f"latent state representation as one dimension is manually set to ±{perturbation_range} \n"
+        f"standard deviations (unit standard normal) while all other \n"
+        f"dimensions are held fixed.",
+        fontsize=12
+    )
     plt.tight_layout()
-    plt.savefig('./out/latent_space_traversal.png')
+    plt.subplots_adjust(top=0.85)
+    plt.savefig(f'./out/latent_space_traversal_{latent_dim}d_{max_kld_weight}_max_kld.png')
     plt.show()
 
 def map_latent_space_to_grid(model, dataset, latent_dim=LATENT_DIM):
@@ -171,7 +206,7 @@ def map_latent_space_to_grid(model, dataset, latent_dim=LATENT_DIM):
 
     indices = torch.randperm(len(dataset))[:10000]
     subset = torch.utils.data.Subset(dataset, indices)
-    dataloader = DataLoader(subset, batch_size=128)
+    dataloader = DataLoader(subset, batch_size=BATCH_SIZE)
     all_z = []
     with torch.no_grad():
         for sample in dataloader:

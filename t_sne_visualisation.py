@@ -8,7 +8,7 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader
 
-from tetris_vae_convolutional import TetrisVAE
+from tetris_vae_convolutional import TetrisConvolutionalVAE
 from tetris_dataset import TetrisDataset
 import tetris_vae_utils as utils
 
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     model_path = "../out/dim_8_max_kld_1.0.pth"
 
     # Load the data
-    vae_model = TetrisVAE(latent_dim=LATENT_DIM).to(DEVICE)
+    vae_model = TetrisConvolutionalVAE(latent_dim=LATENT_DIM).to(DEVICE)
     vae_model = utils.load_model(vae_model, model_path)
     dataset = TetrisDataset(device=DEVICE)
     # Sample a subset of the dataset for visualisation
